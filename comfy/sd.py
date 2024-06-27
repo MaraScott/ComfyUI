@@ -178,6 +178,7 @@ class VAE:
         self.output_channels = 3
         self.process_input = lambda image: image * 2.0 - 1.0
         self.process_output = lambda image: torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
+        self.working_dtypes = [torch.bfloat16, torch.float32]
 
         if config is None:
             if "decoder.mid.block_1.mix_factor" in sd:
@@ -237,14 +238,15 @@ class VAE:
                                                                 decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': ddconfig})
             elif "decoder.layers.0.weight_v" in sd:
                 self.first_stage_model = AudioOobleckVAE()
-                self.memory_used_encode = lambda shape, dtype: (1767 * shape[2]) * model_management.dtype_size(dtype) #TODO: tweak for the audio VAE
-                self.memory_used_decode = lambda shape, dtype: (2178 * shape[2] * 64) * model_management.dtype_size(dtype)
+                self.memory_used_encode = lambda shape, dtype: (1000 * shape[2]) * model_management.dtype_size(dtype)
+                self.memory_used_decode = lambda shape, dtype: (1000 * shape[2] * 2048) * model_management.dtype_size(dtype)
                 self.latent_channels = 64
                 self.output_channels = 2
                 self.upscale_ratio = 2048
                 self.downscale_ratio =  2048
                 self.process_output = lambda audio: audio
                 self.process_input = lambda audio: audio
+                self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
             else:
                 logging.warning("WARNING: No VAE weights detected, VAE not initalized.")
                 self.first_stage_model = None
@@ -265,12 +267,13 @@ class VAE:
         self.device = device
         offload_device = model_management.vae_offload_device()
         if dtype is None:
-            dtype = model_management.vae_dtype()
+            dtype = model_management.vae_dtype(self.device, self.working_dtypes)
         self.vae_dtype = dtype
         self.first_stage_model.to(self.vae_dtype)
         self.output_device = model_management.intermediate_device()
 
         self.patcher = comfy.model_patcher.ModelPatcher(self.first_stage_model, load_device=self.device, offload_device=offload_device)
+        logging.debug("VAE load device: {}, offload device: {}, dtype: {}".format(self.device, offload_device, self.vae_dtype))
 
     def vae_encode_crop_pixels(self, pixels):
         dims = pixels.shape[1:-1]
@@ -295,6 +298,10 @@ class VAE:
             / 3.0)
         return output
 
+    def decode_tiled_1d(self, samples, tile_x=128, overlap=32):
+        decode_fn = lambda a: self.first_stage_model.decode(a.to(self.vae_dtype).to(self.device)).float()
+        return comfy.utils.tiled_scale_multidim(samples, decode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=self.upscale_ratio, out_channels=self.output_channels, output_device=self.output_device)
+
     def encode_tiled_(self, pixel_samples, tile_x=512, tile_y=512, overlap = 64):
         steps = pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x, tile_y, overlap)
         steps += pixel_samples.shape[0] * comfy.utils.get_tiled_scale_steps(pixel_samples.shape[3], pixel_samples.shape[2], tile_x // 2, tile_y * 2, overlap)
@@ -307,6 +314,10 @@ class VAE:
         samples += comfy.utils.tiled_scale(pixel_samples, encode_fn, tile_x // 2, tile_y * 2, overlap, upscale_amount = (1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device, pbar=pbar)
         samples /= 3.0
         return samples
+
+    def encode_tiled_1d(self, samples, tile_x=128 * 2048, overlap=32 * 2048):
+        encode_fn = lambda a: self.first_stage_model.encode((self.process_input(a)).to(self.vae_dtype).to(self.device)).float()
+        return comfy.utils.tiled_scale_multidim(samples, encode_fn, tile=(tile_x,), overlap=overlap, upscale_amount=(1/self.downscale_ratio), out_channels=self.latent_channels, output_device=self.output_device)
 
     def decode(self, samples_in):
         try:
@@ -322,7 +333,10 @@ class VAE:
                 pixel_samples[x:x+batch_number] = self.process_output(self.first_stage_model.decode(samples).to(self.output_device).float())
         except model_management.OOM_EXCEPTION as e:
             logging.warning("Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.")
-            pixel_samples = self.decode_tiled_(samples_in)
+            if len(samples_in.shape) == 3:
+                pixel_samples = self.decode_tiled_1d(samples_in)
+            else:
+                pixel_samples = self.decode_tiled_(samples_in)
 
         pixel_samples = pixel_samples.to(self.output_device).movedim(1,-1)
         return pixel_samples
@@ -348,7 +362,10 @@ class VAE:
 
         except model_management.OOM_EXCEPTION as e:
             logging.warning("Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.")
-            samples = self.encode_tiled_(pixel_samples)
+            if len(pixel_samples.shape) == 3:
+                samples = self.encode_tiled_1d(pixel_samples)
+            else:
+                samples = self.encode_tiled_(pixel_samples)
 
         return samples
 
@@ -551,7 +568,14 @@ def load_unet_state_dict(sd): #load unet in diffusers format
     unet_dtype = model_management.unet_dtype(model_params=parameters)
     load_device = model_management.get_torch_device()
 
-    if "input_blocks.0.0.weight" in sd or 'clf.1.weight' in sd: #ldm or stable cascade
+    if 'transformer_blocks.0.attn.add_q_proj.weight' in sd: #MMDIT SD3
+        new_sd = model_detection.convert_diffusers_mmdit(sd, "")
+        if new_sd is None:
+            return None
+        model_config = model_detection.model_config_from_unet(new_sd, "")
+        if model_config is None:
+            return None
+    elif "input_blocks.0.0.weight" in sd or 'clf.1.weight' in sd: #ldm or stable cascade
         model_config = model_detection.model_config_from_unet(sd, "")
         if model_config is None:
             return None
