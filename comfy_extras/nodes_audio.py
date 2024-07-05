@@ -6,6 +6,7 @@ import os
 import io
 import json
 import struct
+import random
 from comfy.cli_args import args
 
 class EmptyLatentAudio:
@@ -14,15 +15,16 @@ class EmptyLatentAudio:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {}}
+        return {"required": {"seconds": ("FLOAT", {"default": 47.6, "min": 1.0, "max": 1000.0, "step": 0.1})}}
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "generate"
 
     CATEGORY = "_for_testing/audio"
 
-    def generate(self):
+    def generate(self, seconds):
         batch_size = 1
-        latent = torch.zeros([batch_size, 64, 1024], device=self.device)
+        length = round((seconds * 44100 / 2048) / 2) * 2
+        latent = torch.zeros([batch_size, 64, length], device=self.device)
         return ({"samples":latent, "type": "audio"}, )
 
 class VAEEncodeAudio:
@@ -117,7 +119,6 @@ class SaveAudio:
         self.output_dir = folder_paths.get_output_directory()
         self.type = "output"
         self.prefix_append = ""
-        self.compress_level = 4
 
     @classmethod
     def INPUT_TYPES(s):
@@ -167,6 +168,19 @@ class SaveAudio:
 
         return { "ui": { "audio": results } }
 
+class PreviewAudio(SaveAudio):
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_temp_" + ''.join(random.choice("abcdefghijklmnopqrstupvxyz") for x in range(5))
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {"audio": ("AUDIO", ), },
+                "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+                }
+
 class LoadAudio:
     SUPPORTED_FORMATS = ('.wav', '.mp3', '.ogg', '.flac', '.aiff', '.aif')
 
@@ -213,4 +227,5 @@ NODE_CLASS_MAPPINGS = {
     "VAEDecodeAudio": VAEDecodeAudio,
     "SaveAudio": SaveAudio,
     "LoadAudio": LoadAudio,
+    "PreviewAudio": PreviewAudio,
 }
